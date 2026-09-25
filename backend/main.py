@@ -11,8 +11,8 @@ import uuid
 from typing import Literal
 
 import asyncpg
-
 from dotenv import load_dotenv
+from google import genai
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,6 +25,11 @@ MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_SOURCE_CHARS = 12000
 MOCK_USER_ID = "00000000-0000-0000-0000-000000000123"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://scrolled:scrolled@127.0.0.1:5432/scrolled")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_RETRY_ATTEMPTS = 3
+GEMINI_RETRY_DELAYS = (2, 5)
+ENFORCE_BOOK_LIMIT = os.getenv("ENFORCE_BOOK_LIMIT", "false").lower() == "true"
 _db_pool: asyncpg.Pool | None = None
 REVENUECAT_WEBHOOK_SECRET = os.getenv("REVENUECAT_WEBHOOK_SECRET")
 
@@ -108,6 +113,8 @@ def generate_topic_without_ai(source_text: str) -> TopicResponse:
 
 
 async def enforce_book_limit() -> None:
+    if not ENFORCE_BOOK_LIMIT:
+        return
     global _db_pool
     try:
         if _db_pool is None:
@@ -213,6 +220,50 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
+async def generate_topic(source_text: str) -> TopicResponse:
+    if not GEMINI_API_KEY:
+        return await asyncio.to_thread(generate_topic_without_ai, source_text)
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f"""Преобразуй текст учебного материала в короткую учебную ленту.
+Верни только JSON без markdown и без дополнительных полей.
+Схема JSON:
+{{
+  "title": "string",
+  "cards": [{{"type": "text", "title": "string", "text": "string"}}],
+  "quiz": {{"question": "string", "options": ["string", "string", "string"], "correctAnswer": 0}}
+}}
+Требования: 3-5 карточек, type каждой карточки только text, options ровно 3, correctAnswer — индекс правильного ответа.
+
+Текст материала:
+{source_text}
+"""
+    response = None
+    for attempt in range(GEMINI_RETRY_ATTEMPTS):
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": TopicResponse.model_json_schema(),
+                },
+            )
+            break
+        except Exception as exc:
+            is_unavailable = getattr(exc, "status_code", None) == 503 or "UNAVAILABLE" in str(exc)
+            if not is_unavailable or attempt == GEMINI_RETRY_ATTEMPTS - 1:
+                raise
+            delay = GEMINI_RETRY_DELAYS[attempt]
+            print(f"[Gemini] 503 UNAVAILABLE; retry {attempt + 1}/{GEMINI_RETRY_ATTEMPTS - 1} in {delay}s", flush=True)
+            await asyncio.sleep(delay)
+
+    if response is None or not response.text:
+        raise ValueError("Gemini вернул пустой ответ")
+    return TopicResponse.model_validate_json(response.text)
+
+
 def extract_pdf_text(content: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(content))
@@ -244,7 +295,7 @@ async def process_pdf(file: UploadFile = File(...)) -> TopicResponse:
     if not text:
         raise HTTPException(status_code=422, detail="PDF contains no extractable text. Use a text PDF or add OCR for scanned PDFs.")
     try:
-        topic = await asyncio.to_thread(generate_topic_without_ai, text)
+        topic = await generate_topic(text)
         await persist_topic(topic, file.filename or "uploaded.pdf", len(content))
         return topic
     except asyncpg.PostgresError as exc:
