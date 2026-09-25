@@ -1,0 +1,42 @@
+# Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Expo / React Native
+mobile/.expo/
+.expo/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
+dist/
+build/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+
+node_modules/
+.expo/
+dist/
+
+# Блокируем виртуальное окружение бэкенда
+backend/venv/
+venv/
+.env
+__pycache__/
+*.pyc
