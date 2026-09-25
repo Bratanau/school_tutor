@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Audio } from 'expo-av';
+import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import {
   Dimensions,
   FlatList,
@@ -61,33 +61,19 @@ const MOCK_TOPICS: Topic[] = [
 ];
 
 function AudioCard({ card, active }: { card: ContentCard; active: boolean }) {
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const [playing, setPlaying] = useState(false);
+  const player = useAudioPlayer(card.audioUrl ?? null);
+  const status = useAudioPlayerStatus(player);
+
   useEffect(() => {
-    if (active) return;
-    const sound = soundRef.current;
-    soundRef.current = null;
-    if (sound) void sound.stopAsync().then(() => sound.unloadAsync());
-    setPlaying(false);
-  }, [active]);
-  useEffect(() => () => {
-    if (soundRef.current) void soundRef.current.unloadAsync();
-  }, []);
-  async function togglePlayback() {
+    if (!active && status.playing) player.pause();
+  }, [active, player, status.playing]);
+
+  function togglePlayback() {
     if (!active || !card.audioUrl) return;
-    if (!soundRef.current) {
-      const result = await Audio.Sound.createAsync({ uri: card.audioUrl });
-      soundRef.current = result.sound;
-      result.sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) setPlaying(false);
-      });
-    }
-    if (playing) {
-      await soundRef.current.pauseAsync();
-      setPlaying(false);
+    if (status.playing) {
+      player.pause();
     } else {
-      await soundRef.current.playAsync();
-      setPlaying(true);
+      player.play();
     }
   }
   return (
@@ -96,7 +82,7 @@ function AudioCard({ card, active }: { card: ContentCard; active: boolean }) {
       <Text style={styles.cardTitle}>{card.title ?? 'Audio recap'}</Text>
       <Text style={styles.cardText}>{card.text}</Text>
       <Pressable disabled={!card.audioUrl} onPress={togglePlayback} style={styles.audioButton}>
-        <Text style={styles.audioButtonText}>{playing ? 'Pause' : card.audioUrl ? 'Play' : 'Audio unavailable'}</Text>
+        <Text style={styles.audioButtonText}>{status.playing ? 'Pause' : card.audioUrl ? 'Play' : 'Audio unavailable'}</Text>
       </Pressable>
     </View>
   );
@@ -108,7 +94,7 @@ function ContentCardView({ card }: { card: ContentCard }) {
       <Text style={styles.cardType}>{card.type === 'audio' ? 'AUDIO' : 'READ'}</Text>
       <Text style={styles.cardTitle}>{card.title ?? 'Learning card'}</Text>
       <Text style={styles.cardText}>{card.text}</Text>
-      {card.type === 'audio' && <View style={styles.audioStub}><Text style={styles.audioStubText}>Audio ready soon</Text></View>}
+      {card.type === 'audio' && <Text style={styles.audioButtonText}>Audio ready soon</Text>}
     </View>
   );
 }

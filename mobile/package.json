@@ -7,19 +7,20 @@
     "start": "expo start"
   },
   "dependencies": {
-    "@expo/metro-runtime": "~4.0.1",
-    "expo": "~52.0.0",
-    "expo-asset": "~11.0.5",
-    "expo-av": "~15.0.1",
-    "expo-document-picker": "~13.0.1",
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "react-native": "0.76.5",
-    "react-native-pager-view": "6.5.1",
-    "react-native-web": "~0.19.13"
+    "@expo/metro-runtime": "~57.0.16",
+    "expo": "~57.0.0",
+    "expo-asset": "~57.0.18",
+    "expo-audio": "~57.0.5",
+    "expo-document-picker": "~57.0.2",
+    "expo-file-system": "~57.0.7",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-pager-view": "8.0.2",
+    "react-native-web": "^0.21.2"
   },
   "devDependencies": {
-    "@types/react": "~18.3.12",
-    "typescript": "^5.3.3"
+    "@types/react": "~19.2.4",
+    "typescript": "~6.0.3"
   }
 }

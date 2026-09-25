@@ -1,11 +1,15 @@
 import React, { useState } from 'react';
-import { ActivityIndicator, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
+import { fetch as expoFetch } from 'expo/fetch';
+import { File } from 'expo-file-system';
+import { ActivityIndicator, Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import FeedScreen, { Topic } from './components/FeedScreen';
 import PaywallScreen from './PaywallScreen';
 
 // Set this to the development computer's Wi-Fi/LAN address for a physical phone.
-const API_URL = 'http://192.168.1.10:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? (
+  Platform.OS === 'web' || Platform.OS === 'ios' ? 'http://127.0.0.1:8000' : 'http://10.0.2.2:8000'
+);
 const REQUEST_TIMEOUT_MS = 60000;
 
 type UploadState = 'idle' | 'loading' | 'error';
@@ -34,17 +38,18 @@ export default function UploadScreen() {
 
     setStatus('loading');
     const form = new FormData();
-    form.append('file', {
-      uri: file.uri,
-      type: file.mimeType ?? 'application/pdf',
-      name: file.name || 'textbook.pdf',
-    } as unknown as Blob);
+    if (Platform.OS === 'web' && file.file) {
+      form.append('file', file.file);
+    } else {
+      form.append('file', new File(file.uri));
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const response = await fetch(`${API_URL}/process-pdf`, {
+      const requestFetch = Platform.OS === 'web' ? fetch : expoFetch;
+      const response = await requestFetch(`${API_URL}/process-pdf`, {
         method: 'POST',
         body: form,
         signal: controller.signal,
@@ -52,6 +57,7 @@ export default function UploadScreen() {
       const payload = await response.json();
       if (!response.ok) {
         if (response.status === 403) {
+          setStatus('idle');
           setShowPaywall(true);
           return;
         }
