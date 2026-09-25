@@ -1,39 +1,47 @@
 from __future__ import annotations
 
+
 import asyncio
 import io
 import json
 import os
 import re
+import time
 import uuid
-
 from typing import Literal
 
 import asyncpg
-
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from openai import OpenAI, OpenAIError
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 from pypdf import PdfReader
 
 load_dotenv()
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_SOURCE_CHARS = 12000
-OPENAI_TIMEOUT_SECONDS = 45.0
 MOCK_USER_ID = "00000000-0000-0000-0000-000000000123"
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://scrolled:scrolled@127.0.0.1:5432/scrolled")
 _db_pool: asyncpg.Pool | None = None
-
-
 REVENUECAT_WEBHOOK_SECRET = os.getenv("REVENUECAT_WEBHOOK_SECRET")
 
 app = FastAPI(title="ScrollEd API", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    started = time.perf_counter()
+    print(f"[HTTP] -> {request.method} {request.url.path}", flush=True)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        print(f"[HTTP] !! {request.method} {request.url.path}: {exc}", flush=True)
+        raise
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    print(f"[HTTP] <- {response.status_code} {request.method} {request.url.path} {elapsed_ms:.0f}ms", flush=True)
+    return response
 
 
 class ContentCard(BaseModel):
@@ -63,19 +71,6 @@ class TopicResponse(BaseModel):
     quiz: Quiz
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def generate_topic_without_ai(source_text: str) -> TopicResponse:
     sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", source_text.replace("\n", " ")) if part.strip()]
     sentences = [sentence[:700] for sentence in sentences]
@@ -93,13 +88,8 @@ def generate_topic_without_ai(source_text: str) -> TopicResponse:
         if text:
             cards.append(ContentCard(type="text", title=titles[index], text=text))
 
-
-
-
-
-
-
-
+    while len(cards) < 3:
+        cards.append(ContentCard(type="text", title=titles[len(cards)], text=sentences[min(len(cards), len(sentences) - 1)]))
     cards = cards[:5]
     answer = cards[0].text
     distractors = [card.text for card in cards[1:3]]
@@ -117,54 +107,26 @@ def generate_topic_without_ai(source_text: str) -> TopicResponse:
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async def enforce_book_limit() -> None:
     global _db_pool
-    if _db_pool is None:
-        if not DATABASE_URL:
-            raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
-        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with _db_pool.acquire() as connection:
-        entitlement = await connection.fetchrow(
-            "select plan, max_documents from subscription_entitlements where user_id = $1::uuid",
-            MOCK_USER_ID,
-        )
-        plan = entitlement["plan"] if entitlement else "FREE"
-        max_documents = entitlement["max_documents"] if entitlement else 10
-        count = await connection.fetchval("select count(*) from document where owner_id = $1::uuid", MOCK_USER_ID)
-        if plan == "FREE" and count >= (max_documents or 10):
-            raise HTTPException(status_code=403, detail="Достигнут лимит Free-подписки")
+    try:
+        if _db_pool is None:
+            _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with _db_pool.acquire() as connection:
+            entitlement = await connection.fetchrow(
+                "select plan, max_documents from subscription_entitlements where user_id = $1::uuid",
+                MOCK_USER_ID,
+            )
+            plan = entitlement["plan"] if entitlement else "FREE"
+            max_documents = entitlement["max_documents"] if entitlement else 10
+            count = await connection.fetchval("select count(*) from document where owner_id = $1::uuid", MOCK_USER_ID)
+            if plan == "FREE" and count >= (max_documents or 10):
+                raise HTTPException(status_code=403, detail="Достигнут лимит Free-подписки")
+    except HTTPException:
+        raise
+    except (asyncpg.PostgresError, OSError) as exc:
+        print(f"[DB] connection_error={exc!r} url={DATABASE_URL}", flush=True)
+        raise HTTPException(status_code=503, detail="PostgreSQL недоступен. Запустите Docker или задайте DATABASE_URL.") from exc
 
 
 async def persist_topic(topic: TopicResponse, filename: str, source_bytes: int) -> None:
@@ -241,6 +203,7 @@ async def revenuecat_webhook(request: Request) -> dict[str, str]:
     return {"status": "updated"}
 
 
+@app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
@@ -253,8 +216,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 def extract_pdf_text(content: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(content))
-        return "\n".join((page.extract_text() or "") for page in reader.pages[:3]).strip()[:MAX_SOURCE_CHARS]
+        extracted = "\n".join((page.extract_text() or "") for page in reader.pages[:3]).strip()[:MAX_SOURCE_CHARS]
+        print(f"[PDF] pages={len(reader.pages)} extracted_chars={len(extracted)}", flush=True)
+        return extracted
     except Exception as exc:
+        print(f"[PDF] parse_error={exc!r}", flush=True)
         raise HTTPException(status_code=400, detail="Could not parse PDF") from exc
 
 
@@ -269,24 +235,19 @@ async def process_pdf(file: UploadFile = File(...)) -> TopicResponse:
         raise HTTPException(status_code=415, detail="Only PDF files are supported")
     await enforce_book_limit()
     content = await file.read()
+    print(f"[PDF] name={file.filename!r} content_type={file.content_type!r} bytes={len(content)}", flush=True)
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty")
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="PDF exceeds the 25 MB limit")
     text = extract_pdf_text(content)
     if not text:
-        raise HTTPException(status_code=422, detail="PDF contains no extractable text")
+        raise HTTPException(status_code=422, detail="PDF contains no extractable text. Use a text PDF or add OCR for scanned PDFs.")
     try:
-
         topic = await asyncio.to_thread(generate_topic_without_ai, text)
         await persist_topic(topic, file.filename or "uploaded.pdf", len(content))
         return topic
-
+    except asyncpg.PostgresError as exc:
+        raise HTTPException(status_code=503, detail="Database operation failed") from exc
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-
-
-
-
