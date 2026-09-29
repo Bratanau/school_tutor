@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -10,11 +11,12 @@ import uuid
 from typing import Literal
 
 import base64
-import os
 
 import asyncpg
+import boto3
 import httpx
 from dotenv import load_dotenv
+from media import YandexProvider as MediaProvider
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,11 +39,12 @@ YANDEX_ENDPOINT = "https://llm.api.cloud.yandex.net/foundationModels/v1/completi
 
 YANDEX_RETRY_ATTEMPTS = 3
 YANDEX_RETRY_DELAYS = (2, 5)
-
-'''GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-GEMINI_RETRY_ATTEMPTS = 3
-GEMINI_RETRY_DELAYS = (2, 5)'''
+IMAGE_STYLE_SUFFIX = "in 2D semi-cartoon hand-drawn illustration style, vibrant colors, flat design, educational art"
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "https://storage.yandexcloud.net")
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
+S3_PUBLIC_BASE_URL = os.getenv("S3_PUBLIC_BASE_URL")
 
 ENFORCE_BOOK_LIMIT = os.getenv("ENFORCE_BOOK_LIMIT", "false").lower() == "true"
 _db_pool: asyncpg.Pool | None = None
@@ -114,16 +117,20 @@ class YandexProvider:
         }
         self.gpt_endpoint = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         self.art_endpoint = "https://llm.api.cloud.yandex.net/foundationModels/v1/imageGenerationAsync"
-        self.operations_endpoint = "https://llm.api.cloud.yandex.net/operations"
+        self.operations_endpoint = "https://operation.api.cloud.yandex.net/operations"
         self.tts_endpoint = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
 
     async def _generate_json(self, source_text: str) -> list[dict]:
         """Возвращает сырые словари карточек из GPT, у которых будет text и imagePrompt."""
         system_prompt = (
-            "Ты — ИИ-креатор ленты коротких видео (Reels/TikTok) для учебников. "
-            "Ответь СТРОГО массивом JSON-объектов `[{ ... }]`. Для каждой карточки выдай 'text' (содержание факта на русском) "
-            "и 'imagePrompt' (короткое детальное описание того, что нарисовать нейросети на фоне — СТРОГО на АНГЛИЙСКОМ языке). "
-            "Возвращай 3-4 объекта карточки."
+            "Ты — ИИ-креатор образовательной ленты коротких видео. "
+            "Раздели исходный текст на массив из 3-5 последовательных слайдов-фактов. "
+            "Ответь СТРОГО массивом JSON-объектов [{...}], без markdown и комментариев. "
+            "Для каждого слайда обязательно верни поля 'text', 'title' и 'imagePrompt'. "
+            "Каждый imagePrompt должен быть подробным описанием уникальной иллюстрации "
+            "для конкретного факта на АНГЛИЙСКОМ языке и обязательно заканчиваться точным суффиксом: "
+            f"'{IMAGE_STYLE_SUFFIX}'. "
+            "Сохраняй один визуальный стиль, но не повторяй композицию и предметы между слайдами."
         )
         payload = {
             "modelUri": f"gpt://{self.folder_id}/{YANDEX_MODEL}/latest",
@@ -141,6 +148,8 @@ class YandexProvider:
 
     async def _generate_image_s3(self, prompt: str) -> str:
         """Связка YandexART + Polling -> загрузка картинки в S3"""
+        if not self.api_key or not self.folder_id:
+            raise RuntimeError("YANDEX_API_KEY or YANDEX_FOLDER_ID is not configured")
         payload = {
             "modelUri": f"art://{self.folder_id}/yandex-art/latest",
             "generationOptions": {"aspectRatio": {"widthRatio": 9, "heightRatio": 16}},  # Вертикально для телефона
@@ -149,25 +158,44 @@ class YandexProvider:
         async with httpx.AsyncClient(timeout=60.0) as client:
             # 1. Запуск операции YandexART
             start_resp = await client.post(self.art_endpoint, headers=self.headers, json=payload)
-            start_resp.raise_for_status()
-            operation_id = start_resp.json()["id"]
+            if start_resp.status_code == 403:
+                raise RuntimeError(
+                    "YandexART access denied (403). Grant the service account "
+                    "the ai.imageGeneration.user role on YANDEX_FOLDER_ID and verify the folder ID. "
+                    f"API response: {start_resp.text[:500]}"
+                )
+            if start_resp.is_error:
+                raise RuntimeError(f"YandexART start failed ({start_resp.status_code}): {start_resp.text[:1000]}")
+            operation_id = start_resp.json().get("id")
+            if not operation_id:
+                raise RuntimeError(f"YandexART did not return operation id: {start_resp.text[:500]}")
 
-            # 2. Polling операции, пока done == true
-            while True:
+            # 2. Poll the separate Yandex Cloud operations service.
+            for _ in range(90):
                 await asyncio.sleep(2)
                 op_resp = await client.get(f"{self.operations_endpoint}/{operation_id}", headers=self.headers)
-                op_resp.raise_for_status()
+                if op_resp.is_error:
+                    raise RuntimeError(f"YandexART polling failed ({op_resp.status_code}): {op_resp.text[:1000]}")
                 op_data = op_resp.json()
+                if op_data.get("error"):
+                    raise RuntimeError(f"YandexART operation failed: {op_data['error']}")
                 if op_data.get("done"):
-                    base64_str = op_data["response"]["image"]
+                    response = op_data.get("response") or {}
+                    base64_str = response.get("image")
+                    if not base64_str:
+                        raise RuntimeError(f"YandexART returned no image: {op_data}")
                     image_bytes = base64.b64decode(base64_str)
                     break
+            else:
+                raise TimeoutError("YandexART operation timed out after 180 seconds")
             
             # 3. Отдаем в хранилище (Bucket S3) и возвращаем урл
             return await upload_to_storage(image_bytes, "jpeg")
 
     async def _generate_tts_s3(self, text: str) -> str:
         """Связка Yandex SpeechKit -> Загрузка аудио в S3"""
+        if not self.api_key or not self.folder_id:
+            raise RuntimeError("YANDEX_API_KEY or YANDEX_FOLDER_ID is not configured")
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 self.tts_endpoint,
@@ -179,8 +207,8 @@ class YandexProvider:
                     "format": "mp3"
                 }
             )
-            resp.raise_for_status()
-            # Бинарный mp3 файл
+            if resp.is_error:
+                raise RuntimeError(f"Yandex SpeechKit failed ({resp.status_code}): {resp.text[:1000]}")
             return await upload_to_storage(resp.content, "mp3")
 
 
@@ -219,59 +247,31 @@ def generate_topic_without_ai(source_text: str) -> TopicResponse:
         ),
     )
 
-async def generate_topic(source_text: str) -> TopicResponse:
-    provider = YandexProvider()
-    
-    # 1. Просим YandexGPT разделить текст и придумать Image-промпты
-    raw_cards = await provider._generate_json(source_text)
-    
-    completed_cards = []
-    title = raw_cards[0]["text"][:30] + "..." if raw_cards else "Обучение"
-    
-    for i, raw_card in enumerate(raw_cards):
-        text = raw_card["text"]
-        img_prompt = raw_card.get("imagePrompt", f"educational conceptual art, vertical, high resolution")
-
-        # Магия здесь! asyncio.gather генерирует звук И картинку параллельно, экономя огромное количество секунд.
-        try:
-            image_url, audio_url = await asyncio.gather(
-                provider._generate_image_s3(img_prompt),
-                provider._generate_tts_s3(text)
-            )
-        except Exception as exc:
-            print(f"[Yandex] AI Generation Failed: {exc}")
-            image_url = "https://picsum.photos/400/800" # Заглушка, если генерация упала
-            audio_url = "" 
-            
-        completed_cards.append(ContentCard(
-            id=str(uuid.uuid4()),
-            type="audio",
-            title=f"Урок {i+1}",
-            text=text,
-            imageUrl=image_url,
-            audioUrl=audio_url
-        ))
-
-    # Сюда можно так же вернуть Quiz из Prompt №5, я убрал для краткости
-    mock_quiz = Quiz(question="Всё понятно?", options=["Да","Нет"], correctAnswer=0)
-    
-    return TopicResponse(title=title, cards=completed_cards, quiz=mock_quiz)
-
 async def upload_to_storage(file_bytes: bytes, extension: str) -> str:
-    # Заглушка, чтобы не требовать реальные доступы в локальном тесте:
-    # Для продакшена раскомментируй блок Boto3 ниже!
-    
-    '''
-    s3_client = boto3.client('s3', endpoint_url=S3_ENDPOINT_URL, region_name='ru-central1')
-    filename = f"{uuid.uuid4()}.{extension}"
-    s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_bytes, ACL='public-read')
-    return f"{S3_ENDPOINT_URL}/{S3_BUCKET}/{filename}"
-    '''
-    
-    # Имитация URL пока мы тестируем без настроенного бакета:
-    await asyncio.sleep(0.5) 
-    fake_domain = "https://mock-storage.local"
-    return f"{fake_domain}/{uuid.uuid4()}.{extension}"
+    if not S3_BUCKET or not S3_ACCESS_KEY_ID or not S3_SECRET_ACCESS_KEY:
+        raise RuntimeError("S3 storage is not configured: set S3_BUCKET, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY")
+
+    key = f"stories/{uuid.uuid4()}.{extension}"
+
+    def put_object() -> None:
+        client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            region_name="ru-central1",
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        )
+        client.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=file_bytes,
+            ContentType="audio/mpeg" if extension == "mp3" else "image/jpeg",
+            CacheControl="public, max-age=31536000",
+        )
+
+    await asyncio.to_thread(put_object)
+    base_url = S3_PUBLIC_BASE_URL or f"{S3_ENDPOINT_URL}/{S3_BUCKET}"
+    return f"{base_url.rstrip('/')}/{key}"
 
 
 async def ensure_mock_user(connection: asyncpg.Connection) -> None:
@@ -563,6 +563,16 @@ async def process_pdf(file: UploadFile = File(...)) -> TopicResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+class StoryCard(BaseModel):
+    id: str
+    position: int
+    title: str | None = None
+    text: str
+    image_prompt: str
+    image_url: str | None = None
+    audio_url: str | None = None
+
+
 class Story(BaseModel):
     id: str
     user_id: str
@@ -578,11 +588,13 @@ class Story(BaseModel):
     likes_count: int = 0
     comments_count: int = 0
     is_liked: bool = False
+    cards: list[StoryCard] = []
 
 
 class RegenerateMediaRequest(BaseModel):
     type: Literal["image", "audio"]
     custom_prompt: str = Field(min_length=1, max_length=4000)
+    card_id: str | None = None
 
 
 class PublishStoryRequest(BaseModel):
@@ -590,10 +602,30 @@ class PublishStoryRequest(BaseModel):
     category_id: int
 
 
+async def ensure_story_card_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """create table if not exists story_card (
+                id uuid primary key default gen_random_uuid(),
+                story_id uuid not null references story(id) on delete cascade,
+                position integer not null check (position >= 0),
+                title text,
+                text text not null,
+                image_prompt text not null default '',
+                image_url text,
+                audio_url text,
+                created_at timestamptz not null default now(),
+                unique (story_id, position)
+            )"""
+        )
+        await connection.execute("create index if not exists story_card_story_idx on story_card (story_id, position)")
+
+
 async def get_pool() -> asyncpg.Pool:
     global _db_pool
     if _db_pool is None:
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        await ensure_story_card_schema(_db_pool)
     return _db_pool
 
 
@@ -614,12 +646,20 @@ STORY_SELECT = """
            s.created_at, s.status::text,
            (select count(*) from likes l where l.story_id = s.id) as likes_count,
            (select count(*) from comments cm where cm.story_id = s.id) as comments_count,
-           exists(select 1 from likes l where l.story_id = s.id and l.user_id = $1::uuid) as is_liked
+           exists(select 1 from likes l where l.story_id = s.id and l.user_id = $1::uuid) as is_liked,
+           coalesce((select jsonb_agg(jsonb_build_object(
+             'id', sc.id, 'position', sc.position, 'title', sc.title, 'text', sc.text,
+             'image_prompt', sc.image_prompt, 'image_url', sc.image_url, 'audio_url', sc.audio_url
+           ) order by sc.position) from story_card sc where sc.story_id = s.id), '[]'::jsonb) as cards
     from story s left join category c on c.id = s.category_id
 """
 
 
 def story_from_row(row: asyncpg.Record) -> Story:
+    raw_cards = row["cards"]
+    if isinstance(raw_cards, str):
+        raw_cards = json.loads(raw_cards)
+    cards = [StoryCard.model_validate(card) for card in (raw_cards or [])]
     return Story(
         id=str(row["id"]), user_id=str(row["user_id"]), category_id=row["category_id"],
         category_title=row["category_title"], category_emoji=row["category_emoji"],
@@ -627,7 +667,7 @@ def story_from_row(row: asyncpg.Record) -> Story:
         text_script=row["text_script"], created_at=row["created_at"].isoformat(),
         status="PUBLISHED" if row["status"].lower() == "published" else "DRAFT",
         likes_count=int(row["likes_count"]), comments_count=int(row["comments_count"]),
-        is_liked=bool(row["is_liked"]),
+        is_liked=bool(row["is_liked"]), cards=cards,
     )
 
 
@@ -679,6 +719,45 @@ async def get_my_stories(limit: int = 50, offset: int = 0) -> list[Story]:
         return [story_from_row(row) for row in rows]
 
 
+def fallback_slide_cards(source_text: str) -> list[dict[str, str]]:
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", source_text.replace("\n", " ")) if part.strip()]
+    if not sentences:
+        return [{"title": "Новый факт", "text": source_text[:1200], "imagePrompt": "educational concept"}]
+    size = max(1, len(sentences) // 4)
+    cards: list[dict[str, str]] = []
+    for index in range(4):
+        start = index * size
+        end = len(sentences) if index == 3 else min(len(sentences), start + size)
+        text = " ".join(sentences[start:end]).strip()
+        if text:
+            cards.append({"title": f"Факт {index + 1}", "text": text[:1500], "imagePrompt": "educational concept"})
+    return cards[:5]
+
+
+async def render_slide(provider: MediaProvider, raw_card: dict, index: int, source_text: str) -> dict[str, str | int | None]:
+    text = str(raw_card.get("text", "")).strip()[:2000]
+    prompt = str(raw_card.get("imagePrompt", "educational concept")).strip()
+    if IMAGE_STYLE_SUFFIX.lower() not in prompt.lower():
+        prompt = f"{prompt.rstrip(' .,')}, {IMAGE_STYLE_SUFFIX}"
+    fallback_url = f"https://picsum.photos/seed/{hashlib.sha256(f'{source_text}:{index}:{text}'.encode('utf-8')).hexdigest()[:16]}/1080/1920"
+    try:
+        image_url, audio_url = await asyncio.gather(
+            provider.generate_image(prompt),
+            provider.generate_audio(text),
+        ) if YANDEX_API_KEY and YANDEX_FOLDER_ID else (fallback_url, "")
+    except Exception as exc:
+        print(f"[Yandex] slide={index} generation failed: {exc!r}", flush=True)
+        image_url, audio_url = fallback_url, ""
+    return {
+        "position": index,
+        "title": str(raw_card.get("title", f"Факт {index + 1}")),
+        "text": text,
+        "image_prompt": prompt,
+        "image_url": image_url,
+        "audio_url": audio_url,
+    }
+
+
 @app.post("/api/studio/upload", response_model=Story)
 async def studio_upload(file: UploadFile = File(...)) -> Story:
     if file.content_type != "application/pdf":
@@ -690,38 +769,48 @@ async def studio_upload(file: UploadFile = File(...)) -> Story:
     if not source_text:
         raise HTTPException(status_code=422, detail="PDF contains no extractable text")
 
-    provider = YandexProvider()
+    provider = MediaProvider()
     try:
-        cards = await provider._generate_json(source_text) if YANDEX_API_KEY and YANDEX_FOLDER_ID else []
+        raw_cards = await provider.generate_slides(source_text) if YANDEX_API_KEY and YANDEX_FOLDER_ID else fallback_slide_cards(source_text)
     except Exception as exc:
         print(f"[YandexGPT] studio generation failed: {exc!r}", flush=True)
-        cards = []
-    script = str(cards[0].get("text", "")) if cards else source_text[:1500]
-    image_prompt = str(cards[0].get("imagePrompt", "educational vertical illustration")) if cards else "educational vertical illustration"
-    try:
-        image_url, audio_url = await asyncio.gather(
-            provider._generate_image_s3(image_prompt), provider._generate_tts_s3(script)
-        ) if YANDEX_API_KEY and YANDEX_FOLDER_ID else ("https://picsum.photos/seed/story/1080/1920", "")
-    except Exception as exc:
-        print(f"[Yandex] media generation failed: {exc!r}", flush=True)
-        image_url, audio_url = "https://picsum.photos/seed/story/1080/1920", ""
+        raw_cards = fallback_slide_cards(source_text)
+    raw_cards = [card for card in raw_cards if str(card.get("text", "")).strip()][:5]
+    if not raw_cards:
+        raw_cards = fallback_slide_cards(source_text)
+
+    # Each slide independently runs YandexART and SpeechKit in parallel; all slides run concurrently.
+    rendered_cards = await asyncio.gather(*(
+        render_slide(provider, raw_card, index, source_text)
+        for index, raw_card in enumerate(raw_cards)
+    ))
+    first_card = rendered_cards[0]
 
     pool = await get_pool()
     async with pool.acquire() as connection:
         await ensure_feed_user(connection)
-        row = await connection.fetchrow(
-            """insert into story(user_id, owner_id, title, image_url, audio_url, text_script, script, image_prompt, status)
-               values($1::uuid, $1::uuid, $2, $3, $4, $5, $5, $6, 'draft') returning id""",
-            MOCK_USER_ID, (cards[0].get("text", "Новый сюжет")[:80] if cards else "Новый сюжет"),
-            image_url, audio_url, script, image_prompt,
-        )
-        return await fetch_story(connection, row["id"])
+        async with connection.transaction():
+            story_id = await connection.fetchval(
+                """insert into story(user_id, owner_id, title, image_url, audio_url, text_script, script, image_prompt, status)
+                   values($1::uuid, $1::uuid, $2, $3, $4, $5, $5, $6, 'draft') returning id""",
+                MOCK_USER_ID, str(first_card["text"])[:80], first_card["image_url"], first_card["audio_url"],
+                first_card["text"], first_card["image_prompt"],
+            )
+            await connection.executemany(
+                """insert into story_card(story_id, position, title, text, image_prompt, image_url, audio_url)
+                   values($1::uuid, $2, $3, $4, $5, $6, $7)""",
+                [
+                    (story_id, card["position"], card["title"], card["text"], card["image_prompt"], card["image_url"], card["audio_url"])
+                    for card in rendered_cards
+                ],
+            )
+        return await fetch_story(connection, story_id)
 
 
 @app.post("/api/studio/{story_id}/regenerate-media")
 async def regenerate_media(story_id: uuid.UUID, payload: RegenerateMediaRequest) -> dict[str, str]:
     pool = await get_pool()
-    provider = YandexProvider()
+    provider = MediaProvider()
     async with pool.acquire() as connection:
         owned = await connection.fetchval(
             "select exists(select 1 from story where id = $1 and coalesce(user_id, owner_id) = $2::uuid)", story_id, MOCK_USER_ID
@@ -729,11 +818,18 @@ async def regenerate_media(story_id: uuid.UUID, payload: RegenerateMediaRequest)
         if not owned:
             raise HTTPException(status_code=404, detail="Story not found")
         try:
-            url = await (provider._generate_image_s3(payload.custom_prompt) if payload.type == "image" else provider._generate_tts_s3(payload.custom_prompt))
+            url = await (provider.generate_image(payload.custom_prompt) if payload.type == "image" else provider.generate_audio(payload.custom_prompt))
         except Exception as exc:
-            raise HTTPException(status_code=502, detail="Yandex media generation failed") from exc
+            print(f"[Yandex] media generation failed for story={story_id} type={payload.type} card={payload.card_id}: {type(exc).__name__}: {exc}", flush=True)
+            raise HTTPException(status_code=502, detail=f"Yandex media generation failed: {type(exc).__name__}: {exc}") from exc
         column = "image_url" if payload.type == "image" else "audio_url"
-        await connection.execute(f"update story set {column} = $1 where id = $2", url, story_id)
+        if payload.card_id:
+            await connection.execute(
+                f"update story_card set {column} = $1 where id = $2::uuid and story_id = $3::uuid",
+                url, payload.card_id, story_id,
+            )
+        else:
+            await connection.execute(f"update story set {column} = $1 where id = $2", url, story_id)
         return {"type": payload.type, "url": url}
 
 

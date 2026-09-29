@@ -43,7 +43,7 @@ export type Topic = {
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 // Полная высота минус высота нижней навигационной панели
 const CARD_HEIGHT = Dimensions.get('window').height - 172; 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? (Platform.OS === 'web' || Platform.OS === 'ios' ? 'http://127.0.0.1:8000' : 'http://10.0.2.2:8000');
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? (Platform.OS === 'web' ? 'http://127.0.0.1:8000' : Platform.OS === 'ios' ? 'http://172.20.10.2:8000' : 'http://10.0.2.2:8000');
 
 type Comment = { id: string; text: string; authorName: string; createdAt: string };
 
