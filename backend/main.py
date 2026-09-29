@@ -9,10 +9,7 @@ import time
 import uuid
 from typing import Literal
 
-import base64  # ОБЯЗАТЕЛЬНО добавить для ЯндексАРТ!
-import boto3   # ОБЯЗАТЕЛЬНО добавить для S3/Yandex Storage!
-
-
+import base64
 import os
 
 import asyncpg
@@ -564,3 +561,194 @@ async def process_pdf(file: UploadFile = File(...)) -> TopicResponse:
         raise HTTPException(status_code=503, detail="Database operation failed") from exc
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class Story(BaseModel):
+    id: str
+    user_id: str
+    category_id: int | None = None
+    category_title: str | None = None
+    category_emoji: str | None = None
+    title: str
+    image_url: str | None = None
+    audio_url: str | None = None
+    text_script: str
+    created_at: str
+    status: Literal["DRAFT", "PUBLISHED"]
+    likes_count: int = 0
+    comments_count: int = 0
+    is_liked: bool = False
+
+
+class RegenerateMediaRequest(BaseModel):
+    type: Literal["image", "audio"]
+    custom_prompt: str = Field(min_length=1, max_length=4000)
+
+
+class PublishStoryRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    category_id: int
+
+
+async def get_pool() -> asyncpg.Pool:
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return _db_pool
+
+
+async def ensure_feed_user(connection: asyncpg.Connection) -> None:
+    await connection.execute(
+        """insert into app_user(id, email, password_hash)
+           values($1::uuid, $2, $3) on conflict (id) do nothing""",
+        MOCK_USER_ID,
+        "mock-user-123@scrolled.local",
+        "demo-account-no-password-yet",
+    )
+
+
+STORY_SELECT = """
+    select s.id, coalesce(s.user_id, s.owner_id) as user_id, s.category_id,
+           c.title as category_title, c.emoji as category_emoji, s.title,
+           s.image_url, s.audio_url, coalesce(s.text_script, s.script) as text_script,
+           s.created_at, s.status::text,
+           (select count(*) from likes l where l.story_id = s.id) as likes_count,
+           (select count(*) from comments cm where cm.story_id = s.id) as comments_count,
+           exists(select 1 from likes l where l.story_id = s.id and l.user_id = $1::uuid) as is_liked
+    from story s left join category c on c.id = s.category_id
+"""
+
+
+def story_from_row(row: asyncpg.Record) -> Story:
+    return Story(
+        id=str(row["id"]), user_id=str(row["user_id"]), category_id=row["category_id"],
+        category_title=row["category_title"], category_emoji=row["category_emoji"],
+        title=row["title"], image_url=row["image_url"], audio_url=row["audio_url"],
+        text_script=row["text_script"], created_at=row["created_at"].isoformat(),
+        status="PUBLISHED" if row["status"].lower() == "published" else "DRAFT",
+        likes_count=int(row["likes_count"]), comments_count=int(row["comments_count"]),
+        is_liked=bool(row["is_liked"]),
+    )
+
+
+async def fetch_story(connection: asyncpg.Connection, story_id: uuid.UUID) -> Story:
+    row = await connection.fetchrow(STORY_SELECT + " where s.id = $2::uuid", MOCK_USER_ID, story_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Story not found")
+    return story_from_row(row)
+
+
+@app.get("/api/feed", response_model=list[Story])
+async def get_feed(limit: int = 20, offset: int = 0) -> list[Story]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            STORY_SELECT + " where s.status = 'published' order by s.created_at desc limit $2 offset $3",
+            MOCK_USER_ID, min(max(limit, 1), 50), max(offset, 0),
+        )
+        return [story_from_row(row) for row in rows]
+
+
+@app.get("/api/categories")
+async def get_categories() -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch("select id, title, emoji, slug from category order by title")
+        return [dict(row) for row in rows]
+
+
+@app.get("/api/categories/{category_id}/stories", response_model=list[Story])
+async def get_category_stories(category_id: int, limit: int = 20, offset: int = 0) -> list[Story]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            STORY_SELECT + " where s.status = 'published' and s.category_id = $2 order by s.created_at desc limit $3 offset $4",
+            MOCK_USER_ID, category_id, min(max(limit, 1), 50), max(offset, 0),
+        )
+        return [story_from_row(row) for row in rows]
+
+
+@app.get("/api/users/me/stories", response_model=list[Story])
+async def get_my_stories(limit: int = 50, offset: int = 0) -> list[Story]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            STORY_SELECT + " where coalesce(s.user_id, s.owner_id) = $2::uuid order by s.created_at desc limit $3 offset $4",
+            MOCK_USER_ID, MOCK_USER_ID, min(max(limit, 1), 100), max(offset, 0),
+        )
+        return [story_from_row(row) for row in rows]
+
+
+@app.post("/api/studio/upload", response_model=Story)
+async def studio_upload(file: UploadFile = File(...)) -> Story:
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=415, detail="Only PDF files are supported")
+    content = await file.read()
+    if not content or len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="PDF is empty or exceeds the 25 MB limit")
+    source_text = extract_pdf_text(content)
+    if not source_text:
+        raise HTTPException(status_code=422, detail="PDF contains no extractable text")
+
+    provider = YandexProvider()
+    try:
+        cards = await provider._generate_json(source_text) if YANDEX_API_KEY and YANDEX_FOLDER_ID else []
+    except Exception as exc:
+        print(f"[YandexGPT] studio generation failed: {exc!r}", flush=True)
+        cards = []
+    script = str(cards[0].get("text", "")) if cards else source_text[:1500]
+    image_prompt = str(cards[0].get("imagePrompt", "educational vertical illustration")) if cards else "educational vertical illustration"
+    try:
+        image_url, audio_url = await asyncio.gather(
+            provider._generate_image_s3(image_prompt), provider._generate_tts_s3(script)
+        ) if YANDEX_API_KEY and YANDEX_FOLDER_ID else ("https://picsum.photos/seed/story/1080/1920", "")
+    except Exception as exc:
+        print(f"[Yandex] media generation failed: {exc!r}", flush=True)
+        image_url, audio_url = "https://picsum.photos/seed/story/1080/1920", ""
+
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        await ensure_feed_user(connection)
+        row = await connection.fetchrow(
+            """insert into story(user_id, owner_id, title, image_url, audio_url, text_script, script, image_prompt, status)
+               values($1::uuid, $1::uuid, $2, $3, $4, $5, $5, $6, 'draft') returning id""",
+            MOCK_USER_ID, (cards[0].get("text", "Новый сюжет")[:80] if cards else "Новый сюжет"),
+            image_url, audio_url, script, image_prompt,
+        )
+        return await fetch_story(connection, row["id"])
+
+
+@app.post("/api/studio/{story_id}/regenerate-media")
+async def regenerate_media(story_id: uuid.UUID, payload: RegenerateMediaRequest) -> dict[str, str]:
+    pool = await get_pool()
+    provider = YandexProvider()
+    async with pool.acquire() as connection:
+        owned = await connection.fetchval(
+            "select exists(select 1 from story where id = $1 and coalesce(user_id, owner_id) = $2::uuid)", story_id, MOCK_USER_ID
+        )
+        if not owned:
+            raise HTTPException(status_code=404, detail="Story not found")
+        try:
+            url = await (provider._generate_image_s3(payload.custom_prompt) if payload.type == "image" else provider._generate_tts_s3(payload.custom_prompt))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Yandex media generation failed") from exc
+        column = "image_url" if payload.type == "image" else "audio_url"
+        await connection.execute(f"update story set {column} = $1 where id = $2", url, story_id)
+        return {"type": payload.type, "url": url}
+
+
+@app.post("/api/studio/{story_id}/publish", response_model=Story)
+async def publish_story(story_id: uuid.UUID, payload: PublishStoryRequest) -> Story:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        category_exists = await connection.fetchval("select exists(select 1 from category where id = $1)", payload.category_id)
+        if not category_exists:
+            raise HTTPException(status_code=404, detail="Category not found")
+        updated = await connection.fetchval(
+            """update story set title = $1, category_id = $2, status = 'published'
+               where id = $3 and coalesce(user_id, owner_id) = $4::uuid returning id""",
+            payload.title.strip(), payload.category_id, story_id, MOCK_USER_ID,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Story not found")
+        return await fetch_story(connection, story_id)
