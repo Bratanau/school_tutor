@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { fetch as expoFetch } from 'expo/fetch';
 import { File } from 'expo-file-system';
 import { ActivityIndicator, Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
@@ -11,14 +12,33 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? (
   Platform.OS === 'web' || Platform.OS === 'ios' ? 'http://127.0.0.1:8000' : 'http://10.0.2.2:8000'
 );
 const REQUEST_TIMEOUT_MS = 60000;
+const LIBRARY_STORAGE_KEY = '@scrolled/topics';
 
 type UploadState = 'idle' | 'loading' | 'error';
 
 export default function UploadScreen() {
   const [topics, setTopics] = useState<Topic[] | null>(null);
+  const [libraryReady, setLibraryReady] = useState(false);
+  const [isAdding, setIsAdding] = useState(false);
   const [status, setStatus] = useState<UploadState>('idle');
   const [showPaywall, setShowPaywall] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    AsyncStorage.getItem(LIBRARY_STORAGE_KEY)
+      .then((value) => {
+        if (!value) return;
+        const saved = JSON.parse(value) as Topic[];
+        if (Array.isArray(saved) && saved.length > 0) setTopics(saved);
+      })
+      .catch(() => undefined)
+      .finally(() => setLibraryReady(true));
+  }, []);
+
+  async function persistTopics(nextTopics: Topic[]) {
+    setTopics(nextTopics.length > 0 ? nextTopics : null);
+    await AsyncStorage.setItem(LIBRARY_STORAGE_KEY, JSON.stringify(nextTopics));
+  }
 
   async function uploadAndProcessFile() {
     setError('');
@@ -64,7 +84,9 @@ export default function UploadScreen() {
         throw new Error(payload?.error ?? payload?.detail ?? `Server error (${response.status})`);
       }
       const parsed = validateTopic(payload);
-      setTopics([parsed]);
+      const nextTopics = [...(topics ?? []), parsed];
+      await persistTopics(nextTopics);
+      setIsAdding(false);
       setStatus('idle');
     } catch (err) {
       setStatus('error');
@@ -78,31 +100,43 @@ export default function UploadScreen() {
     }
   }
 
+  if (!libraryReady) return null;
   if (showPaywall) return <PaywallScreen onClose={() => setShowPaywall(false)} onPurchased={() => setShowPaywall(false)} />;
-  if (topics) return <FeedScreen topics={topics} />;
+  if (topics && !isAdding) return (
+      <FeedScreen
+        key={topics.map((topic) => topic.title).join('|')}
+        topics={topics}
+        onAdd={() => setIsAdding(true)}
+        onDelete={(index) => void persistTopics(topics.filter((_, topicIndex) => topicIndex !== index))}
+      />
+  );
 
   return (
     <SafeAreaView style={styles.safe}>
-      <View style={styles.header}><Text style={styles.logo}>ScrollEd</Text><Text style={styles.label}>PDF TO LEARNING FEED</Text></View>
+      <View style={styles.header}>
+        <View><Text style={styles.logo}>ScrollEd</Text><Text style={styles.headerMeta}>ЛЕНТА ОБУЧЕНИЯ</Text></View>
+        <Pressable accessibilityRole="button" accessibilityLabel={isAdding ? 'Back to library' : 'Open Pro'} onPress={() => isAdding ? setIsAdding(false) : setShowPaywall(true)} hitSlop={8}>
+          <Text style={styles.proLink}>{isAdding ? 'Назад' : 'Pro'}</Text>
+        </Pressable>
+      </View>
       <View style={styles.content}>
         {status === 'loading' ? (
-          <View style={styles.loading}>
-            <ActivityIndicator size="large" color="#E47752" />
-            <Text style={styles.loadingTitle}>Искусственный интеллект изучает вашу книгу...</Text>
-            <Text style={styles.secondary}>Обычно это занимает несколько секунд</Text>
+          <View style={styles.loadingPanel}>
+            <ActivityIndicator size="small" color="#E47752" />
+            <Text style={styles.loadingTitle}>Создаём учебную ленту</Text>
+            <Text style={styles.secondary}>Читаем PDF и создаём короткие карточки.</Text>
           </View>
         ) : (
-          <>
-            <Text style={styles.title}>Превратите учебник в ленту</Text>
-            <Text style={styles.secondary}>Выберите PDF, чтобы получить короткие карточки и проверочный вопрос.</Text>
+          <View style={styles.intro}>
+            <Text style={styles.eyebrow}>ИЗ PDF В ПРАКТИКУ</Text>
+            <Text style={styles.title}>Запоминайте больше из каждой книги.</Text>
+            <Text style={styles.secondary}>Загрузите PDF и получите короткие карточки, итог и проверочный вопрос.</Text>
             <Pressable accessibilityRole="button" onPress={uploadAndProcessFile} style={styles.button}>
               <Text style={styles.buttonText}>Выбрать PDF</Text>
-            </Pressable>
-            <Pressable accessibilityRole="button" onPress={() => setShowPaywall(true)} style={styles.secondaryButton}>
-              <Text style={styles.secondaryButtonText}>Улучшить до Pro · $7/месяц</Text>
+              <Text style={styles.buttonHint}>до 25 МБ</Text>
             </Pressable>
             {status === 'error' && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
-          </>
+          </View>
         )}
       </View>
     </SafeAreaView>
@@ -125,17 +159,19 @@ function validateTopic(value: unknown): Topic {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#101418' },
-  header: { height: 76, paddingHorizontal: 22, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#283139' },
-  logo: { color: '#F6F3EA', fontSize: 24, fontWeight: '800' },
-  label: { color: '#A7B3B0', fontSize: 10, letterSpacing: 1 },
-  content: { flex: 1, padding: 26, justifyContent: 'center' },
-  title: { color: '#F6F3EA', fontSize: 32, lineHeight: 39, fontWeight: '800' },
-  secondary: { color: '#B6C1BD', fontSize: 16, lineHeight: 24, marginTop: 14 },
-  button: { marginTop: 28, minHeight: 54, backgroundColor: '#E47752', borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
+  header: { height: 64, paddingHorizontal: 18, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#283139' },
+  logo: { color: '#F6F3EA', fontSize: 20, fontWeight: '800' },
+  headerMeta: { color: '#A7B3B0', fontSize: 10, letterSpacing: 1, marginTop: 2 },
+  proLink: { color: '#E47752', fontSize: 13, fontWeight: '800' },
+  content: { flex: 1, padding: 20, justifyContent: 'center' },
+  intro: { maxWidth: 440 },
+  eyebrow: { color: '#E47752', fontSize: 10, fontWeight: '800', letterSpacing: 1.4, marginBottom: 12 },
+  title: { color: '#F6F3EA', fontSize: 28, lineHeight: 34, fontWeight: '800' },
+  secondary: { color: '#B6C1BD', fontSize: 15, lineHeight: 22, marginTop: 12 },
+  button: { marginTop: 24, minHeight: 54, paddingHorizontal: 18, backgroundColor: '#E47752', borderRadius: 6, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 10 },
   buttonText: { color: '#101418', fontSize: 16, fontWeight: '800' },
-  secondaryButton: { marginTop: 12, minHeight: 50, borderWidth: 1, borderColor: '#E47752', borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
-  secondaryButtonText: { color: '#E47752', fontSize: 15, fontWeight: '700' },
-  loading: { alignItems: 'center', paddingHorizontal: 12 },
-  loadingTitle: { color: '#F6F3EA', fontSize: 20, lineHeight: 28, fontWeight: '700', textAlign: 'center', marginTop: 24 },
+  buttonHint: { color: '#613123', fontSize: 12, fontWeight: '700' },
+  loadingPanel: { alignItems: 'center', padding: 22, borderWidth: 1, borderColor: '#283139', borderRadius: 8 },
+  loadingTitle: { color: '#F6F3EA', fontSize: 17, fontWeight: '700', marginTop: 12 },
   error: { color: '#F0A38C', fontSize: 14, lineHeight: 20, marginTop: 18 },
 });
