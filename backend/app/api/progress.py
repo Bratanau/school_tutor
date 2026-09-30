@@ -1,0 +1,67 @@
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from app.core.settings import settings
+from app.services.progress_tracker import ProgressEvent, ProgressTracker
+
+router = APIRouter(prefix="/api/progress", tags=["progress"])
+
+
+class TrackQuizRequest(BaseModel):
+    exam_id: UUID
+    topic_id: UUID
+    is_correct: bool
+    user_id: UUID | None = None
+    card_id: UUID | None = None
+    is_initial: bool = False
+
+
+class TrackQuizResponse(BaseModel):
+    mastery_score: float
+
+
+class AssessmentAnswerRequest(BaseModel):
+    exam_id: UUID
+    topic_id: UUID
+    question_index: int = Field(ge=0)
+    answer_index: int = Field(ge=0)
+    user_id: UUID | None = None
+
+
+@router.post("/assessment-answer")
+async def assessment_answer(payload: AssessmentAnswerRequest) -> dict:
+    try:
+        return await ProgressTracker().complete_assessment(
+            user_id=payload.user_id or UUID(settings.demo_user_id),
+            exam_id=payload.exam_id,
+            topic_id=payload.topic_id,
+            question_index=payload.question_index,
+            answer_index=payload.answer_index,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+
+@router.post("/track-quiz", response_model=TrackQuizResponse)
+async def track_quiz(payload: TrackQuizRequest) -> TrackQuizResponse:
+    try:
+        mastery_score = await ProgressTracker().track_quiz(
+            ProgressEvent(
+                user_id=payload.user_id or UUID(settings.demo_user_id),
+                exam_id=payload.exam_id,
+                topic_id=payload.topic_id,
+                card_id=payload.card_id,
+                is_initial=payload.is_initial,
+                quiz_correct=payload.is_correct,
+            )
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return TrackQuizResponse(mastery_score=mastery_score)
