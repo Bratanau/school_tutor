@@ -5,7 +5,7 @@ const env = (globalThis as { process?: { env?: Record<string, string | undefined
 
 export const API_URL = env?.EXPO_PUBLIC_API_URL ?? (
   Platform.OS === 'web' || Platform.OS === 'ios'
-    ? 'http://192.168.0.106:8000'
+    ? 'http://127.0.0.1:8000'
     : 'http://10.0.2.2:8000'
 );
 
@@ -51,15 +51,27 @@ export type LearningCard = {
   topic_id: string;
   depth_level: number;
   position: number;
-  card_type: 'content' | 'quiz' | 'assessment';
+  card_type: 'content' | 'quiz';
   title: string;
   body: string;
   quiz_payload: QuizPayload | null;
   media_url: string | null;
   media_caption: string | null;
   code_block: string | null;
+  formula: string | null;
   generated_by: string;
 };
+
+async function request(url: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45_000);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw new Error('Сервер отвечает слишком долго. Повторите попытку.');
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const payload = await response.json().catch(() => null);
@@ -70,12 +82,12 @@ async function parseResponse<T>(response: Response): Promise<T> {
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
-  return parseResponse<T>(await fetch(`${API_URL}${path}`));
+  return parseResponse<T>(await request(`${API_URL}${path}`));
 }
 
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return parseResponse<T>(
-    await fetch(`${API_URL}${path}`, {
+    await request(`${API_URL}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -84,7 +96,7 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 export async function apiDelete(path: string): Promise<void> {
-  const response = await fetch(`${API_URL}${path}`, { method: 'DELETE' });
+  const response = await request(`${API_URL}${path}`, { method: 'DELETE' });
   if (!response.ok) throw new Error(`Server error (${response.status})`);
 }
 export async function getCurrentExamId(): Promise<string | null> {

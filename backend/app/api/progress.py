@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -30,6 +31,19 @@ class AssessmentAnswerRequest(BaseModel):
     user_id: UUID | None = None
 
 
+@router.get("/assessment")
+async def get_assessment(topic_id: UUID, exam_id: UUID, user_id: UUID | None = None) -> dict:
+    try:
+        return await ProgressTracker().get_assessment(
+            user_id=user_id or UUID(settings.demo_user_id), exam_id=exam_id, topic_id=topic_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (asyncpg.PostgresError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503 if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else 502, detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL." if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else str(exc)) from exc
+
+
+
 @router.post("/assessment-answer")
 async def assessment_answer(payload: AssessmentAnswerRequest) -> dict:
     try:
@@ -42,8 +56,8 @@ async def assessment_answer(payload: AssessmentAnswerRequest) -> dict:
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (asyncpg.PostgresError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503 if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else 502, detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL." if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else str(exc)) from exc
 
 
 
@@ -62,6 +76,6 @@ async def track_quiz(payload: TrackQuizRequest) -> TrackQuizResponse:
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL.") from exc
     return TrackQuizResponse(mastery_score=mastery_score)

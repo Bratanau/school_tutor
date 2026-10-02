@@ -49,7 +49,7 @@ async def persist_exam(owner_id: UUID, name: str, question_text: str) -> ParseEx
         )
     except ExamParserError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except (asyncpg.PostgresError, OSError) as exc:
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
         raise HTTPException(
             status_code=503,
             detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL.",
@@ -137,7 +137,7 @@ async def list_my_exams(user_id: UUID | None = None) -> list[dict]:
                    from exams e where e.owner_id = $1 order by e.created_at desc""",
                 owner_id,
             )
-    except (asyncpg.PostgresError, OSError) as exc:
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
         raise HTTPException(
             status_code=503,
             detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL.",
@@ -197,7 +197,7 @@ async def list_exams(user_id: UUID | None = None) -> list[dict]:
                    from exams e where owner_id = $1 order by created_at desc""",
                 owner_id,
             )
-    except (asyncpg.PostgresError, OSError) as exc:
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
         raise HTTPException(
             status_code=503,
             detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL.",

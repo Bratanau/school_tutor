@@ -23,10 +23,10 @@ const DEMO_USER_ID = '00000000-0000-0000-0000-000000000123';
 
 type TopicCarouselProps = { topic: FeedTopic; active: boolean; pageHeight: number };
 
-function QuizCard({ card, topicId, examId, initial = false, onInitialComplete }: { card: LearningCard; topicId: string; examId: string; initial?: boolean; onInitialComplete?: () => void }) {
+function QuizCard({ card, topicId, examId }: { card: LearningCard; topicId: string; examId: string }) {
   const payload = card.quiz_payload ?? {};
-  const questions = initial && card.quiz_payload?.questions?.length ? card.quiz_payload.questions : [payload];
-  const [questionIndex, setQuestionIndex] = useState(0);
+  const questions = [payload];
+  const [questionIndex] = useState(0);
   const currentQuestion = questions[questionIndex] ?? payload;
   const options = currentQuestion.options?.length ? currentQuestion.options : [card.body];
   const correctAnswer = currentQuestion.correct_answer ?? currentQuestion.correctAnswer ?? 0;
@@ -39,26 +39,13 @@ function QuizCard({ card, topicId, examId, initial = false, onInitialComplete }:
     // Progress is intentionally fire-and-forget: the answer state is optimistic and
     // a temporary network failure must not interrupt the horizontal learning gesture.
     try {
-      await apiPost(
-        initial ? '/api/progress/assessment-answer' : '/api/progress/track-quiz',
-        initial ? {
-          exam_id: examId,
-          topic_id: topicId,
-          question_index: questionIndex,
-          answer_index: index,
-          user_id: DEMO_USER_ID,
-        } : {
-          exam_id: examId,
-          topic_id: topicId,
-          card_id: card.id,
-          user_id: DEMO_USER_ID,
-          is_correct: index === correctAnswer,
-        },
-      );
-      if (initial && questionIndex < questions.length - 1) {
-        setQuestionIndex((value) => value + 1);
-        setSelected(null);
-      } else if (initial) onInitialComplete?.();
+      await apiPost('/api/progress/track-quiz', {
+        exam_id: examId,
+        topic_id: topicId,
+        card_id: card.id,
+        user_id: DEMO_USER_ID,
+        is_correct: index === correctAnswer,
+      });
     } catch {
       // Keep the selected answer visible if the network is temporarily unavailable.
     }
@@ -66,7 +53,7 @@ function QuizCard({ card, topicId, examId, initial = false, onInitialComplete }:
 
   return (
     <View style={styles.quizWrap}>
-      <Text style={styles.kicker}>{initial ? `ПЕРВИЧНЫЙ ОПРОС · ${questionIndex + 1}/${questions.length}` : 'ПРОВЕРКА ЗНАНИЙ'}</Text>
+      <Text style={styles.kicker}>ПРОВЕРКА ЗНАНИЙ</Text>
       <Text style={styles.quizQuestion}>{currentQuestion.question ?? card.title}</Text>
       {options.map((option, index) => {
         const chosen = selected === index;
@@ -90,10 +77,7 @@ function QuizCard({ card, topicId, examId, initial = false, onInitialComplete }:
   );
 }
 
-function LearningCardView({ card, topic, onInitialComplete }: { card: LearningCard; topic: FeedTopic; onInitialComplete?: () => void }) {
-  if (card.card_type === 'assessment') {
-    return <QuizCard card={card} topicId={topic.id} examId={topic.exam_id} initial onInitialComplete={onInitialComplete} />;
-  }
+function LearningCardView({ card, topic }: { card: LearningCard; topic: FeedTopic }) {
   if (card.card_type === 'quiz') {
     return <QuizCard card={card} topicId={topic.id} examId={topic.exam_id} />;
   }
@@ -109,6 +93,7 @@ function LearningCardView({ card, topic, onInitialComplete }: { card: LearningCa
         <Text style={styles.depth}>УРОВЕНЬ {card.depth_level}</Text>
         <Text style={styles.cardTitle}>{card.title}</Text>
         <Text style={styles.cardBody}>{card.body}</Text>
+        {card.formula && <Text style={styles.formulaBlock}>{card.formula}</Text>}
         {card.code_block && <Text style={styles.codeBlock}>{card.code_block}</Text>}
         <Text style={styles.generated}>Wikipedia · проверено YandexGPT</Text>
       </ScrollView>
@@ -186,7 +171,7 @@ function TopicCarousel({ topic, active, pageHeight }: TopicCarouselProps) {
 
   const renderCard = ({ item }: { item: LearningCard }) => (
     <View style={[styles.horizontalPage, { height: pageHeight }]}>
-      <LearningCardView card={item} topic={topic} onInitialComplete={() => { setCards([]); setDepth(0); requestedDepth.current.clear(); }} />
+      <LearningCardView card={item} topic={topic} />
       <AskButton card={item} />
     </View>
   );
@@ -317,6 +302,7 @@ const styles = StyleSheet.create({
   depth: { color: '#F28A62', fontSize: 10, fontWeight: '900', letterSpacing: 1.1, marginBottom: 8 },
   cardTitle: { color: '#fff', fontSize: 18, lineHeight: 23, fontWeight: '900', marginBottom: 8 },
   cardBody: { color: '#E2E2E2', fontSize: 16, lineHeight: 23 },
+  formulaBlock: { color: '#F7D794', backgroundColor: '#211D12', borderWidth: 1, borderColor: '#6B5524', borderRadius: 6, padding: 12, marginTop: 14, fontSize: 17, lineHeight: 25, textAlign: 'center' },
   codeBlock: { color: '#D8F3DC', backgroundColor: '#101B14', borderWidth: 1, borderColor: '#244C31', borderRadius: 6, padding: 10, marginTop: 14, fontFamily: 'monospace', fontSize: 13, lineHeight: 19 },
   generated: { color: '#666', fontSize: 10, marginTop: 14 },
   askButton: { position: 'absolute', right: 18, bottom: 28, width: 46, height: 46, borderRadius: 23, backgroundColor: '#F28A62', alignItems: 'center', justifyContent: 'center', elevation: 5 },

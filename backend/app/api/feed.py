@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.settings import settings
@@ -24,8 +25,8 @@ async def vertical_feed(
                 limit=limit,
             )
         )
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL.") from exc
 
 
 @router.get("/horizontal")
@@ -46,5 +47,5 @@ async def horizontal_feed(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except (RuntimeError, OSError) as exc:
-        raise HTTPException(status_code=502, detail=f"Deep-dive generation failed: {exc}") from exc
+    except (asyncpg.PostgresError, RuntimeError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503 if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else 502, detail="PostgreSQL is unavailable. Start the database and verify DATABASE_URL." if isinstance(exc, (asyncpg.PostgresError, TimeoutError)) else f"Deep-dive generation failed: {exc}") from exc

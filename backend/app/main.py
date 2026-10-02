@@ -41,5 +41,6 @@ async def health() -> dict[str, str]:
 
 app.include_router(ai.router)
 app.include_router(exams.router)
+app.include_router(feed.router)
 app.include_router(progress.router)
 app.include_router(wiki_media.router)

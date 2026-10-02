@@ -137,7 +137,7 @@ class FeedAlgorithm:
         async with pool.acquire() as connection:
             rows = await connection.fetch(
                 """select id, topic_id, depth_level, position, card_type,
-                          title, body, quiz_payload, media_url, media_caption, code_block, generated_by
+                          title, body, quiz_payload, media_url, media_caption, code_block, formula, generated_by
                    from cards
                    where topic_id = $1 and depth_level = $2
                    order by position
@@ -146,6 +146,8 @@ class FeedAlgorithm:
                 target_depth,
                 min(max(limit, 1), 20),
             )
+            if rows:
+                return await self._hydrate_existing_cards(connection, rows)
             knowledge = await connection.fetchrow(
                 "select assessment_completed, initial_level, assessment_questions, assessment_answers, assessment_total from user_knowledge where user_id = $1 and exam_id = (select exam_id from exam_topics where id = $2) and topic_id = $2",
                 user_id, topic_id,
@@ -157,18 +159,6 @@ class FeedAlgorithm:
             )
             if not topic:
                 raise LookupError("Topic not found")
-            if not knowledge or not knowledge["assessment_completed"]:
-                if knowledge and knowledge["assessment_questions"]:
-                    assessment = {"questions": knowledge["assessment_questions"]}
-                else:
-                    assessment = await self.provider.generate_initial_assessment(topic["title"], topic["description"])
-                    questions = assessment.get("questions", [])
-                    await connection.execute(
-                        """insert into user_knowledge(user_id, exam_id, topic_id, assessment_questions, assessment_answers, assessment_total, updated_at) values($1,$2,$3,$4::jsonb,'[]'::jsonb,$5,now()) on conflict (user_id,exam_id,topic_id) do update set assessment_questions=$4::jsonb, assessment_answers='[]'::jsonb, assessment_total=$5, updated_at=now()""",
-                        user_id, topic["exam_id"], topic_id, json.dumps(questions, ensure_ascii=False), len(questions),
-                    )
-                return [{"id": f"assessment-{topic_id}", "topic_id": str(topic_id), "depth_level": 0, "position": 0, "card_type": "assessment", "title": "Первичный опрос", "body": topic["description"], "quiz_payload": assessment, "media_url": None, "media_caption": None, "code_block": None, "generated_by": "yandexgpt"}]
-
 
         generated = await self.provider._generate_json_deep_dive(
             topic["title"], topic["description"], initial_level
@@ -193,6 +183,7 @@ class FeedAlgorithm:
                         "wiki_search_query": str(item.get("wiki_search_query", "")).strip(),
                         "wiki_search_query_en": str(item.get("wiki_search_query_en", "")).strip(),
                         "code_block": str(item.get("code_block") or "").strip() or None,
+                        "formula": str(item.get("formula") or "").strip() or None,
                         "media_url": None,
                         "media_caption": None,
                     }
@@ -239,8 +230,8 @@ class FeedAlgorithm:
                     await connection.execute(
                         """insert into cards(
                                topic_id, depth_level, position, card_type,
-                               title, body, quiz_payload, media_url, media_caption, code_block, generated_by
-             ) values($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, 'yandexgpt')
+                               title, body, quiz_payload, media_url, media_caption, code_block, formula, generated_by
+             ) values($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, 'yandexgpt')
                            on conflict (topic_id, depth_level, position) do nothing""",
                         topic_id,
                         target_depth,
@@ -252,10 +243,11 @@ class FeedAlgorithm:
                         card["media_url"],
                         card["media_caption"],
                         card["code_block"],
+                        card["formula"],
                     )
                 rows = await connection.fetch(
                     """select id, topic_id, depth_level, position, card_type,
-                              title, body, quiz_payload, media_url, media_caption, code_block, generated_by
+                              title, body, quiz_payload, media_url, media_caption, code_block, formula, generated_by
                        from cards
                        where topic_id = $1 and depth_level = $2
                        order by position limit $3""",
@@ -279,6 +271,7 @@ class FeedAlgorithm:
             "media_url": row["media_url"],
             "media_caption": row["media_caption"],
             "code_block": row["code_block"],
+            "formula": row["formula"],
         }
 
     async def vertical(self, request: FeedRequest) -> list[dict[str, Any]]:

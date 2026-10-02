@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { createContext, ReactNode, useCallback, useContext, useEffect, useState } from 'react';
+import { apiGet } from './api';
 
 const ACTIVE_EXAM_KEY = 'scrolled.active-exam-id';
 
@@ -17,7 +18,13 @@ export function ActiveExamProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void AsyncStorage.getItem(ACTIVE_EXAM_KEY)
+      .then(async (storedId) => {
+        if (storedId) return storedId;
+        const exams = await apiGet<{ id: string }[]>('/api/exams/me');
+        return exams[0]?.id ?? null;
+      })
       .then(setActiveExamIdState)
+      .catch(() => setActiveExamIdState(null))
       .finally(() => setIsLoadingActiveExam(false));
   }, []);
 

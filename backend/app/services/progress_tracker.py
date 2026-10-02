@@ -76,6 +76,21 @@ class ProgressTracker:
                 )
         return float(score)
 
+    async def get_assessment(self, *, user_id: UUID, exam_id: UUID, topic_id: UUID) -> dict[str, object]:
+        pool = await get_pool()
+        async with pool.acquire() as connection:
+            topic = await connection.fetchrow("select id, exam_id, title, description from exam_topics where id=$1 and exam_id=$2", topic_id, exam_id)
+            if not topic:
+                raise LookupError("Topic not found")
+            row = await connection.fetchrow("select assessment_questions, assessment_answers, assessment_total, assessment_completed from user_knowledge where user_id=$1 and exam_id=$2 and topic_id=$3", user_id, exam_id, topic_id)
+            if row and row["assessment_questions"]:
+                questions = row["assessment_questions"]
+            else:
+                assessment = await YandexProvider().generate_initial_assessment(topic["title"], topic["description"])
+                questions = assessment.get("questions", [])
+                await connection.execute("""insert into user_knowledge(user_id, exam_id, topic_id, assessment_questions, assessment_answers, assessment_total, updated_at) values($1,$2,$3,$4::jsonb,'[]'::jsonb,$5,now()) on conflict (user_id,exam_id,topic_id) do update set assessment_questions=$4::jsonb, assessment_answers='[]'::jsonb, assessment_total=$5, assessment_completed=false, updated_at=now()""", user_id, exam_id, topic_id, json.dumps(questions, ensure_ascii=False), len(questions))
+            return {"topic_id": str(topic_id), "title": topic["title"], "questions": questions, "completed": bool(row and row["assessment_completed"])}
+
     async def complete_assessment(self, *, user_id: UUID, exam_id: UUID, topic_id: UUID, question_index: int, answer_index: int) -> dict[str, object]:
         pool = await get_pool()
         async with pool.acquire() as connection:
@@ -100,7 +115,6 @@ class ProgressTracker:
             level = await YandexProvider().evaluate_initial_assessment(row["title"], questions, answers)
             await connection.execute("""update user_knowledge set assessment_answers=$4::jsonb, assessment_completed=true, initial_level=$5, mastery_score=$5, updated_at=now() where user_id=$1 and exam_id=$2 and topic_id=$3""", user_id, exam_id, topic_id, json.dumps(answers), level)
             return {"completed": True, "answered": total, "total": total, "level": level}
-
-
+    async def track(self, event: ProgressEvent) -> None:
         if event.quiz_correct is not None:
             await self.track_quiz(event)
